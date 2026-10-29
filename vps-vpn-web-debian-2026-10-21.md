@@ -26,6 +26,7 @@ Xray-core and Nginx run as native systemd services, with no Docker.
 - Backups are encrypted with `age` before going off-box.
 - The Xray fallback test uses `--resolve`, since a bare-IP curl always shows a TLS error.
 - Section numbering is fixed.
+- The Xray access log is disabled for privacy (§2.4, §2.7).
 
 Every command runs as **root**. Replace `<ANGLE_BRACKETS>` with your own values.
 Version numbers are fetched live, not hardcoded.
@@ -304,7 +305,7 @@ tee /usr/local/etc/xray/config.json <<'EOF'
 {
   "log": {
     "loglevel": "warning",
-    "access": "/var/log/xray/access.log",
+    "access": "none",
     "error": "/var/log/xray/error.log"
   },
   "inbounds": [
@@ -343,6 +344,8 @@ chmod 644 /usr/local/etc/xray/config.json
 ```
 `"listen": "0.0.0.0"` is IPv4 only. If clients should connect over IPv6, change it to `"::"`.
 Requests without valid VLESS credentials are transparently proxied to www.cloudflare.com.
+`"access": "none"` disables the access log, so the server keeps no per-client record of visited
+sites. The error log stays on for troubleshooting. To turn it off on an already running server, see §2.7.
 
 ### 2.5 Start and verify
 ```
@@ -366,6 +369,9 @@ curl -sv --resolve www.cloudflare.com:443:<VPS_IP> https://www.cloudflare.com -o
 
 ### 2.5.1 Help
 Might fail with error: "Failed to start: main: failed to create server > app/log: failed to initialize access logger > open /var/log/xray/access.log: permission denied". Most likely, not an expected user owns some files.
+
+With `"access": "none"` (§2.4) the access-log variant can't happen, but the same error and fix
+apply to `error.log`. In that case `access.log` won't appear in the listings below.
 
 Find out.
 
@@ -402,6 +408,59 @@ ss -tlnp | grep ':443'
 - Store the private key, public key (Password), UUID and short ID in a password manager.
 - Rotate them every 3–6 months: regenerate via §2.2, update the config, run
   `systemctl restart xray`, and reissue client links.
+
+### 2.7 Disable the access log on an existing server
+Servers set up before §2.4 used `"access": "none"` log every site each client visits to
+`/var/log/xray/access.log`. Turn it off and delete what's been collected. Run these on the VPS as root. Each line under a command block starting with `# expected:` is what that command should print.
+
+**1. Back up the current config:**
+```bash
+cp /usr/local/etc/xray/config.json /usr/local/etc/xray/config.json.bak-$(date +%F)
+```
+
+**2. Turn off the access log:**
+```bash
+jq '.log.access = "none"' /usr/local/etc/xray/config.json > /tmp/xray.json && mv /tmp/xray.json /usr/local/etc/xray/config.json && chmod 644 /usr/local/etc/xray/config.json
+```
+
+**3. Check the change:**
+```bash
+jq '.log' /usr/local/etc/xray/config.json
+# expected:
+#   { "loglevel": "warning", "access": "none", "error": "/var/log/xray/error.log" }
+```
+
+**4. Test the config:**
+```bash
+xray run -test -config /usr/local/etc/xray/config.json
+# expected (last line): Configuration OK.
+```
+
+**5. Restart Xray and confirm it's running:**
+```bash
+systemctl restart xray && systemctl is-active xray
+# expected: active
+```
+
+**6. Securely delete the old access logs, including rotated copies:**
+```bash
+shred -u /var/log/xray/access.log* 2>/dev/null; ls -l /var/log/xray/
+# expected: only error.log
+```
+
+**7. Check that nothing new gets logged.** Connect with the VPN client and open a few sites, then run:
+```bash
+ls /var/log/xray/access.log 2>/dev/null || echo "no access log"
+# expected: no access log
+```
+
+**Optional:** at `warning` level, the error log can still record client IPs on failed or odd connections. To log only real errors:
+```bash
+jq '.log.loglevel = "error"' /usr/local/etc/xray/config.json > /tmp/xray.json && mv /tmp/xray.json /usr/local/etc/xray/config.json && chmod 644 /usr/local/etc/xray/config.json && xray run -test -config /usr/local/etc/xray/config.json && systemctl restart xray
+# expected (last line of the test): Configuration OK.
+```
+
+Once the access log is off, the check in guide §6 that tails `access.log` won't work any more. To confirm a client is connected, check the egress IP with `curl https://api.ipify.org` from the client instead.
 
 ---
 
@@ -756,10 +815,11 @@ vless://<CLIENT_UUID>@<VPS_IP>:443?security=reality&encryption=none&pbk=<REALITY
   curl -k --max-time 10 https://<VPS_IP>:8443
   # expected: curl: (28) Connection timed out after 10000 milliseconds
   ```
-- On the VPS, the Xray access log should show your client:
+- On the VPS, your client should show up as an established connection on 443 (the access log
+  is disabled, §2.4):
   ```
-  tail -n 5 /var/log/xray/access.log
-  # expected: lines like "... from <CLIENT_IP>:<port> accepted tcp:<dest>:443 [... email: client1]"
+  ss -tn state established '( sport = :443 )'
+  # expected: one or more lines with <VPS_IP>:443 and <CLIENT_IP>:<port>
   ```
 
 ---
@@ -898,6 +958,7 @@ age -d -i vps-backup.agekey vps-backup-<DATE>.tar.gz.age | tar xzf -
 - [x] `fail2ban-client status sshd` shows the jail active (journald backend).
 - [x] `curl -sv --resolve www.cloudflare.com:443:<VPS_IP> https://www.cloudflare.com` returns Cloudflare's certificate and `HTTP/2 200`.
 - [x] The VPN client connects via the §6 link, and the egress IP is the VPS.
+- [ ] `jq .log /usr/local/etc/xray/config.json` shows `"access": "none"`, and `/var/log/xray/access.log` doesn't exist (§2.7).
 - [x] `https://<yourdomain.com>` loads the site through Cloudflare (Origin Rule → 8443).
 - [ ] Zone-level AOP status is `active` (§3.5), and the site still loads with `ssl_verify_client on`.
 - [x] `crontab -l` lists the UFW refresh, backup and rclone jobs.
